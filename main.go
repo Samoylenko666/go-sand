@@ -6,13 +6,17 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
+	"time"
+
+	"github.com/dgrijalva/jwt-go"
 	"golang.org/x/crypto/bcrypt"
+
 	//"github.com/davecgh/go-spew/spew"
 	"github.com/gorilla/mux"
 	_ "github.com/lib/pq"
 )
-
 
 // DB is a global variable to hold db connection
 var DB *sql.DB
@@ -32,7 +36,7 @@ type User struct {
 	Password string `json:"password"`
 }
 
-type Token struct {
+type JwtToken struct {
 	Id    int    `json:"id"`
 	Token string `json:"token"`
 }
@@ -83,7 +87,32 @@ func responseWithError(response http.ResponseWriter, status int, error Error) {
 
 func responseWithSucces(response http.ResponseWriter, data interface{}) {
 	response.Header().Set("Content-type", "application/json")
+	response.WriteHeader(http.StatusOK)
 	json.NewEncoder(response).Encode(data)
+}
+
+func generateToken(user User) (string, error) {
+
+	// Create the JWT key used to create the signature
+	var jwtKey = []byte("secret")
+
+	//  iss - чувствительная к регистру строка или URI, которая является уникальным идентификатором стороны, генерирующей токен
+	claims := jwt.MapClaims{
+		"email": user.Email,
+		"iss":   "WASD",
+		"exp":   time.Now().Add(time.Minute * 60).Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+
+	tokenStr, err := token.SignedString(jwtKey)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	return tokenStr, nil
+
 }
 
 func index(response http.ResponseWriter, request *http.Request) {
@@ -139,19 +168,114 @@ func register(response http.ResponseWriter, request *http.Request) {
 
 	user.Password = ""
 
-	responseWithSucces(response,user)
+	responseWithSucces(response, user)
 }
 
 func login(response http.ResponseWriter, request *http.Request) {
-	fmt.Println("Invoked login method")
+	var user User
+	var jwt JwtToken
+	var error Error
+
+	json.NewDecoder(request.Body).Decode(&user)
+
+	if user.Email == "" {
+		error.Message = "Email is missing"
+		responseWithError(response, http.StatusBadRequest, error)
+		return
+	}
+
+	if user.Password == "" {
+		error.Message = "Password is missing"
+		responseWithError(response, http.StatusBadRequest, error)
+		return
+	}
+
+	password := user.Password
+
+	stmt := "select * from users where email = $1"
+
+	row := DB.QueryRow(stmt, user.Email)
+
+	err := row.Scan(&user.Id, &user.Email, &user.Password, &user.Name)
+
+	if err != nil {
+		if err == sql.ErrNoRows {
+			error.Message = "The user dosen't exists"
+			responseWithError(response, http.StatusBadRequest, error)
+			return
+		}
+
+		log.Fatal(err)
+	}
+
+	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(password))
+
+	if err != nil {
+		error.Message = "The password is invalid"
+		responseWithError(response, http.StatusBadRequest, error)
+		return
+	}
+
+	token, err := generateToken(user)
+
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	jwt.Token = token
+
+	responseWithSucces(response, jwt)
+	fmt.Println(token)
+
 }
 
 func profile(response http.ResponseWriter, request *http.Request) {
 	fmt.Println("Invoked profile method")
+
+	response.Write([]byte("Success zaebis "))
+
+	return
 }
 
 func TokenVerifyMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
-	fmt.Println("Invoked TokenVerifyMiddleware method")
-	return nil
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		var errorObj Error
+		authHeader := request.Header.Get("Authorization")
+
+		bearerToken := strings.Split(authHeader, " ")
+
+		if len(bearerToken) == 2 {
+			authToken := bearerToken[1]
+			token, error := jwt.Parse(authToken, func(token *jwt.Token) (interface{}, error) {
+
+				if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("Pizda")
+				}
+				return []byte("secret"), nil
+			})
+
+			if error != nil {
+				errorObj.Message = error.Error()
+
+				responseWithError(response, http.StatusBadRequest, errorObj)
+				return
+			}
+
+			if token.Valid {
+				next.ServeHTTP(response, request)
+			} else {
+				errorObj.Message = error.Error()
+				responseWithError(response, http.StatusBadRequest, errorObj)
+				return
+			}
+
+		} else {
+			errorObj.Message = "Invalid token"
+			responseWithError(response, http.StatusUnauthorized, errorObj)
+			return
+		}
+
+	})
+
 }
